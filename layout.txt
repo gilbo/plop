@@ -1,0 +1,538 @@
+
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+
+This file contains random sketches and should definitely not be considered a functioning specification of Plop.  Eventually, I hope it will form the basis for a more formal document
+
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+WARNING WARNING
+
+
+
+A good reference from David Terei on reasoning for Go's syntax choices
+https://blog.golang.org/gos-declaration-syntax
+
+
+Observations from some reading:
+
+- most work on data description languages is focused on describing the layout of data stored in files or data coming over the wire.  There is less focus on describing the layout of data in main memory.
+
+
+=====================================
+  Design Goals
+
+* Simplicity:        Must be possible to learn in under an hour
+* Parsimonious:      Drop features as much as possible
+* Interoperability:  Must be easy to express pre-existing C data
+* Random-Access:     Must be low/zero-cost to random access to elements
+* Cache/Page-Aware:  Should be possible to capture alignment & chunking
+* Parallelism:       Should be amenable to SIMD-use
+* Control:           Layout decisions affecting performance should not
+                     be abstracted out of the users control
+* Tabular data:      Database-table sort of data must be handled
+
+  Lesser Goals
+
+* Dynamic Alloc:     Should be possible to add/remove elements, but this is
+                     tricky to get right.
+* Disk-Friendly:     Would be good if this works for disk
+* ProtoBuf:          Would be cool to support proto-buf interoperability
+* Tree-Data:         It's not important if this can handle tree-structures
+
+  Non Goals
+
+* Memory Safety:     No effort need be made to make data access safe
+* Concurrency/Locks: Should not manage concurrent access policy
+* Recursive Data:    If data is scattered around the heap, oh well.
+* Maybe/Choice:      Sum-Types and choice are not that important
+
+
+
+=====================================
+  Examples
+
+logical Triangles {
+  n_tri : size
+  verts : [n_tri] {
+    v : [3]uint
+    n : [3]float
+    c : float
+  }
+}
+
+// this is a trivial, static layout
+physical T1 {
+  n_tri : size32
+  verts : [n_tri] {
+    v : [3]uint32
+    n : [3]float64
+    c : float64
+  }
+}
+
+// this is a layout where we've decided exactly how many triangles we want
+physical T2 {
+  n_tri = 5432
+  verts : [n_tri]{
+    v : [3]uint32
+    n : [3]float64
+    c : float64
+  }
+}
+
+// this is a layout that will better accomodate array re-allocation
+// We've also padded the layout to ensure 8-byte alignment.
+physical T3 {
+  n_tri : size32,
+  verts : * [n_tri] {
+    v : [3]uint32
+    _ : [4]byte
+    n : [3]float64
+    c : float64
+  }
+}
+
+// Here's a more column-oriented layout, again with re-allocatable arrays
+physical T4 {
+  n_tri : size32,
+  verts : {
+    v : * [n_tri][3]uint32
+    n : * [n_tri][3]float64
+    c : * [n_tri]float64
+  }
+}
+
+// Here's an even more aggressively column-oriented layout
+physical T5 {
+  n_tri : size32,
+  {
+    v : [3] * [n_tri] uint3
+    n : [3] * [n_tri] float64
+    c : * [n_tri] float64
+  }
+}
+
+// Now here, we've gone even further and blocked the data into chunks,
+// and for good measure of insanity, we're totally ok with storing the
+// relevant chunks continuously
+physical T6 {
+  n_tri : size32,
+  chunk_size = 32
+  [ n_chunks ; chunk_size ] = n_tri
+  {
+    v : * [n_chunks][3][chunk_size]uint32
+    n : * [n_chunks][3][chunk_size]float64
+    c : * [n_chunks][chunk_size]float64
+  }
+}
+
+
+
+=====================================
+  Concrete Syntax
+
+<Decl>      ::= <Prim>
+              | [<var>|<const>] <Decl>  // array
+              | * <Decl>                // pointer-indirection
+              | { <Rec>+ }              // struct
+<Rec>       ::= <var> : <Decl>
+              | <var> = <const>
+              | <var> = <var>           // TODO
+              | <var> = <var> / <var>   // TODO
+
+<Prim>      ::= int
+              | uint
+              | size
+              | float
+      // the following are physical primitives
+              | size8   | size16  | size32  | size64
+              | uint8   | uint16  | uint32  | uint64
+              |  int8   |  int16  |  int32  |  int64
+              | float32 | float64
+              | byte      // aliases to uint8
+
+<const>     ::= [0-9]+
+<var>       ::= <name>    // internally represented as symbols
+<name>      ::= _                       // not a name, used for padding
+              | [a-zA-Z_][a-zA-Z_0-9]*  // cannot be exactly _
+
+=====================================
+  Symbols
+
+  Internally, we convert variable names to symbols.  In the case of constant numeric array sizes, we use the constant as a name surrogate
+
+<PlopSym>   ::= (<name>|<const>, <unique_id>, <SymKind>)
+<SymKind>   ::= VAR
+              | IDX
+              | PTR
+
+There is a single PTR symbol.
+If a symbol has name '_' then we call it a NoneSymbol.
+The two kinds VAR and IDX are used to distinguish between a size variable and variables used to index into arrays of that size.
+
+  NOTE: There are still some naming related bugs when there are multiple, nested uses of the same variable size.  For instance, [n][n]float64.  These issues still need to be resolved...
+
+=====================================
+  Constant-Sized Array Sugar
+
+  If a constant is used instead of a variable name in an array declaration, then we use a symbol with a "numeric name"
+
+=====================================
+  Path IR
+
+<Token>     ::= () | .<Var> | [<Var>]
+
+<Path>      ::= ( <Token>+, <Prim>|<const> )
+
+=====================================
+  Expression IR
+
+<Expr>      ::= <Expr>(<Prim>?)   // pointer dereference
+              | <Expr> + <Expr>
+              | <Expr> * <Expr>
+              | <const>
+              | <symbol>(<Prim>?)
+
+=====================================
+  Typechecking
+
+Typechecking should:
+  - check that whenever a size variable is used, it is in scope
+  - resolve symbols
+  - annotate array declarations with constant size and/or size primitive types
+  - record the set of size variable definitions within every declaration
+    and the path from the declaration root to that definition
+
+We call the path from a declaration root to the definition of a variable the varpath.  We assume it can be trivially looked up.
+
+In Addition to this basic type-checking, the following judgements can be employed to show different validity properties of a layout:
+  - random access
+  - alignment
+  - path ambiguity
+
+
+
+=================================================
+  Physical vs. Logical Layouts
+
+Define a lattice of terms { L, P, T, B } (T for top and B for bottom)
+Define a MEET operation in the expected way: (commutativity assumed)
+  (T /\ x) = x
+  (L /\ L) = L
+  (L /\ P) = B
+  (P /\ P) = P
+  (B /\ x) = B
+
+lp_anlaysis( Prim )         = T if the number of bits are specified,
+                              L otherwise
+lp_anlaysis( *x )           = false
+lp_anlaysis( [v]x )         = is_logical(x)
+lp_anlaysis({ v:x, rs })    = is_phys_logic(x) and is_phys_logic({ rs })
+lp_anlaysis({ v=c, rs })    = is_logical({ rs })
+
+is_physical( decl )       = not is_logical( decl )
+
+
+
+=================================================
+  Sizeof a layout
+
+The returned expression represents the size of the data described by the declaration.  The values of variables in the expression are not resolved unless they are known to be constant.
+
+sizeof : Decl --> Expr
+
+sizeof(Prim)            = # bytes in Prim
+sizeof(*x)              = # bytes in a system pointer
+sizeof([v]x)
+  v has constant value  = const(v) * sizeof(x)
+  v is variable         = v * sizeof(x)
+sizeof({ v:x, rs })     = sizeof(x) + sizeof({ rs })
+sizeof({ v=c, rs })     = sizeof({ rs })
+
+=================================================
+  Offset Expressions
+
+Given an input expression representing an address for data structured by Decl, offset() returns an output expression representing the address for the data accessed via the path of tokens.
+
+offset : Decl, List(Token), Expr --> Expr
+
+offset(  , empty, ptr )           = ptr
+offset( *x, () p, ptr )           = offset(x, p, ptr() )
+offset( [v]x, [v] p, ptr )        = offset(x, p, ptr + IdxVar(v) * sizeof(x))
+offset({ w:x, rs }, .v p, ptr )   = offset({ rs }, .v p, ptr + sizeof(x))
+offset({ v:x, rs }, .v p, ptr )   = offset(x, p, ptr)
+offset({ w=c, rs }, .v p, ptr )   = offset({ rs }, .v p, ptr)
+
+=================================================
+  Alignment
+
+alignment : Decl -> uint
+
+alignment(Prim)       = sizeof(Prim)
+alignment(*x)         = sizeof(Ptr)
+alignment([v]x)       = alignment(x)
+alignment({ rs })     = MAX_( v:x in rs ) alignment(x)
+
+NOTE: Since all sizes of primitives are powers of 2, all alignment values will always be powers of 2.  We rely on this assumption in the following.
+
+The following function finds the largest divisor of an expression that is also a power of 2.
+
+g2d( c )      = greatest power of 2 dividing c
+g2d( v )      = 1
+g2d( x() )    = infinity
+g2d( x + y )  = MIN( g2d(x), g2d(y) )
+g2d( x * y )  = g2d(x) * g2d(y)
+
+NOTE: We assume that the expression has been constant propagated already.
+
+To determine whether or not a given declaration is aligned, we use this function that fuses offset() together with a series of alignment checks.
+
+is_aligned : Decl, Expr --> True?
+
+is_aligned( Prim, addr )          = alignment(Prim) divides g2d(addr)
+is_aligned(  * x, addr )          =    alignment(*) divides g2d(addr)
+                                and  is_aligned( x, addr() )
+is_aligned( [v]x, addr )          =    alignment(x) divides g2d(sizeof(x))
+                                and    alignment(x) divides g2d(addr)
+                                and  is_aligned( x, addr + sizeof(x) * Idx(v) )
+is_aligned({ v=c, rs }, addr )    =  is_aligned( { rs }, addr )
+is_aligned({ v:x, rs }, addr )    =  alignment(x) divides g2d(addr)
+                                and  is_aligned( x, addr )
+                                and  is_aligned( { rs }, addr + sizeof(x) )
+
+=================================================
+  Expression Expansion
+
+We define a generic notion of expression substitution/recursive-expansion.  In order to specialize this generic notion, we need an _interpretation_ of an expression into an object of type X as a collection of functions
+
+Interpretation(X) =
+  deref     : X,Prim --> X
+  add       : X,X --> X
+  mul       : X,X --> X
+  variable  : symbol,Prim --> Maybe(X)
+  const     : uint --> X
+  default   : () --> X    // 0 arguments (used in event of error)
+  ptr       : () --> X    // 0 arguments
+
+Then an expansion of an expression is defined as 
+
+expand : Decl, Interpretation(X), Expr --> X
+
+(the first argument is the root declaration for the expansion; the values of size variables can be looked up from there, and the X returned by I.ptr() is assumed to represent a pointer to this root)
+
+expand( r, I, e1 + e2 )   = I.add( expand(r,I,e1), expand(r,I,e2) )
+expand( r, I, e1 * e2 )   = I.mul( expand(r,I,e1), expand(r,I,e2) )
+expand( r, I, c )         = I.const( c )
+expand( r, I, e(p) )      = I.deref( expand(r,I,e), p )
+expand( r, I, sym(p) )
+  Check for infinite recursion on sym
+  sym == PTR ?            = I.ptr()
+  let V = I.variable(sym,p)
+  CASES   V == SOME(x)  = x
+          V == NONE     = I.deref( expand(r,I,offset(r, varpath(r,sym), PTR),
+                                   p )
+
+=================================================
+  Random Access
+
+Consider the set of paths in a declaration
+
+  paths(decl)
+
+Then, for each such path p, we try to expand it using the interpretation
+RA_Interp
+  deref(x,p)      = void
+  add(x,x)        = void
+  mul(x,x)        = void
+  variable(n,p)   = if IDX_SYM(n) then SOME(void) else NONE
+  const(c)        = void
+  default         = void
+  ptr             = void
+
+If expand(decl, RA_Interp, p) detects an infinite recursion then we report back that the declaration is not randomly-accessible.  Since this infinite recursion is detected based on some size variable, we can also report which size variable is not randomly-accessible.
+
+
+=================================================
+  Paths of a Declaration
+
+A Path Set can be pre-pended by a token, which we write
+  token..pset
+Two path sets can be agglomerated, which we write
+  pset1 U pset2
+A set with a single path, with no tokens and terminator of a given type may be constructed as
+  { prim | const }
+
+
+paths : Decl --> { Path }   // a set of paths
+
+paths(Prim)         = {Prim}
+paths(*x)           = ()..paths(x)
+paths([v]x)         = [IdxSym(v)]..paths(x)
+paths({ v:x, rs })  = (.v .. paths(x)) U paths({ rs })
+paths({ v=c, rs })  =  (.v .. { c })   U paths({ rs })
+
+=================================================
+  Normalized Paths and Subpaths
+
+A path consists of a series of tokens and a terminating primitive or constant
+
+To normalize a path, simply
+  1. drop all dereference tokens (),
+  2. sort all the remaining tokens so that all Field s precede all Index s
+  3. sort all Field tokens by alphanumeric string order
+  4. sort all Index tokens by alphanumeric string order
+
+Let NP(decl) denote the set of normalized paths in a declaration.
+
+=================================================
+  Ambiguous Path Sets
+
+We say that one path is a subpath of another path  p1 < p2  iff. the Field token prefix of normalized(p1) is a sub-sequence of the Field token prefix of normalized(p2).
+
+If a path set contains two distinct paths p1 and p2 s.t. p1 < p2, then we say that the path set is _ambiguous_
+
+Ambiguous path sets are detected and rejected by the typechecker.
+
+=================================================
+  Logical Sub-typing
+
+As is usually the case with sub-typing, it should be defined based on the ability of the sub-type to fulfill all operations that are available on the super-type.
+
+Note that every full access to a leaf-primitive in the layout is accomplished via a path.  Therefore, we use paths as a proxy for the set of operations available.
+
+Def: D1 is a sub-type of D2 iff.
+  for each (normalized) path p2=(tkns, T2) in NP(D2),
+    there is a unique (normalized) path p1=(tkns,T1) in NP(D1),
+      s.t. T1 is a sub-type of T2.
+
+Specifically
+  size8, size16, ... are subtypes of size
+  likewise for every other bit-annotated type
+  no bit-annotated types are subtypes of any other distinct bit-annotated type
+
+
+
+=================================================
+  Physical Cursors
+
+
+
+
+
+
+=================================================
+  Logical Cursors
+
+
+when something gets peeled away in a logical cursor access,
+we need to clarify what that corresponds to...
+
+
+
+
+
+
+
+
+
+
+We can also establish a re-mapping from paths of one layout to paths of another
+
+
+
+
+
+
+
+two entry points to the library:
+1)  Terra DSL interface
+2)  PlopLib namespace (i.e. Lua table)
+
+
+PlopLib.is_layout(obj)    -- Lua Representation of Layout
+  layout:is_physical()
+  layout:is_logical()
+
+  layout:is_ptr()
+    layout:deref()
+  layout:is_array()
+    layout:arraysize()
+    layout:arrayelem()
+  layout:is_struct()
+    layout:fields()
+  layout:is_prim()
+
+PlopLib
+
+
+
+
+PlopLib.is_physical(obj)  -- is a physical layout
+  -- ALIASES for CURSOR ROUTINES
+  layout.sizeof()
+  layout.alloc( alloc_func, [sizes] )
+  layout.free( cursor, free_func )
+
+PlopLib.is_logical(obj)
+  layout(physical_layout) -- yields a specialized logical layout
+  layout:is_specialized()
+
+
+
+
+PlopLib.is_cursor(obj)
+layout:cursor()           -- Terra struct for manipulating the Layout
+  cursor.layout()
+
+  cursor:ptr()      should return the pointer stored in the cursor
+  cursor:sizeof()   should return the size of the data pointed to
+  cursor()          for pointer-type cursors, returns a cursor to deref
+  cursor(idx_num)   for array-type cursors, returns a cursor to element
+  cursor.field      for struct-type cursors, returns a cursor to 'field'
+    (idx_num) and .field will also work for a cursor that's a pointer
+      to an array or struct correspondingly
+
+  cursor.New( ptr, [freevars] )
+
+  ( ptr cursors only )
+  cursor:alloc( alloc_func, [sizes] )
+  cursor:free( free_func )
+
+  ( cursors to all other non-primitive layouts )
+  cursor.alloc( alloc_func, [sizes] )
+  cursor.free( cursor, free_func )
+
+
+
+
+TODO REMOVE VARPATH STUFF FROM RAND-ACCESS
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
