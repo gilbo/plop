@@ -4,6 +4,8 @@
     
     by Gilbert Bernstein
     March 2016
+    
+  See LICENSE
 --]]
 
 local PLOP = require 'plop_core'

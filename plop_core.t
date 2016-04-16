@@ -5,6 +5,8 @@
     See interface description at the end of this file for more information
     by Gilbert Bernstein
     March 2016
+    
+  See LICENSE
 --]]
 
 import 'adt'

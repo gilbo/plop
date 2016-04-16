@@ -1,4 +1,7 @@
 import 'adt'
+--
+--  See LICENSE
+--
 
 local ADT A
   Var     = { name : string }

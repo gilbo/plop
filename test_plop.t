@@ -1,4 +1,7 @@
 import 'plop'
+--
+--  See LICENSE
+--
 
 local PLOP = require 'ploplib'
 PLOP.extend {

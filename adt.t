@@ -8,6 +8,8 @@
     Original Lua translation by Zach Devito (ASDL in Terra)
     Modified and Customized by Gilbert Bernstein (renamed ADT)
     March 2016
+    
+  See LICENSE
 --]]
 local ADT = require('adt_impl')
 

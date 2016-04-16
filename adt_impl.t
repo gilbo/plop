@@ -8,6 +8,8 @@
     Original Lua translation by Zach Devito (ASDL in Terra)
     Modified and Customized by Gilbert Bernstein (renamed ADT)
     March 2016
+
+  See LICENSE
 --]]
 
 local newlist, islist = terralib.newlist, terralib.islist
