@@ -137,7 +137,7 @@ local freesizevar_intepreter = set_as_interpreter({
 local function layout_freesizevars(layout)
   local vars = freesizevar_weak_cache[layout]
   if not vars then
-    vars = eval_sizeof(layout,freesizevar_intepreter)
+    vars = eval_sizeof(layout,freesizevar_intepreter,{ no_expand = true })
     freesizevar_weak_cache[layout] = vars
   end
   return vars
@@ -153,7 +153,7 @@ local function new_terra_interp(ptrexpr,varbind,idxbind)
     end,
     add       = function(x,y)   return `x + y end,
     mul       = function(x,y)   return `x * y end,
-    const     = function(n)     return n end,
+    const     = function(n)     return terralib.cast(uint64,n) end,
     default   = function()      return 0 end,
     ptr       = function()      return ptrexpr end,
     variable  = function(name)  return varbind[name] end,
@@ -164,6 +164,11 @@ end
 local function terraexpr_sizeof(layout, ptr, varbind)
   local interpreter = new_terra_interp(ptr, varbind, {})
   return eval_sizeof(layout, interpreter)
+end
+
+local function terraexpr_sizeof_noexpand(layout, ptr, varbind)
+  local interpreter = new_terra_interp(ptr, varbind, {})
+  return eval_sizeof(layout, interpreter, { no_expand=true })
 end
 
 -- tkns is a list of path token info
@@ -311,7 +316,7 @@ local function new_cursor_typ(cname_prefix, layout)
     for name,sym,_ in sizevars:tuples() do bindings[name] = sym end
     local terra alloc_helper( alloc : {uint64}->{&opaque}, [sizesyms] )
       -- note that we're assuming every relevant size variable has been bound
-      var n_bytes = [terraexpr_sizeof(layout, nil, bindings)]
+      var n_bytes = [terraexpr_sizeof_noexpand(layout, nil, bindings)]
       return [ptrtyp]( alloc(n_bytes) )
     end
 

@@ -144,13 +144,13 @@ physical T6 {
   Concrete Syntax
 
 <Decl>      ::= <Prim>
-              | [<var>|<const>] <Decl>  // array
+              | [<var>] <Decl>  // array
               | * <Decl>                // pointer-indirection
               | { <Rec>+ }              // struct
-<Rec>       ::= <var> : <Decl>
-              | <var> = <const>
-              | <var> = <var>           // TODO
-              | <var> = <var> / <var>   // TODO
+<Rec>       ::= <id_str> : <Decl>
+              | <id_str> = <id_str>
+              | <id_str> = <id_str>           // TODO
+              | <id_str> = <id_str> / <id_str>
 
 <Prim>      ::= int
               | uint
@@ -163,9 +163,10 @@ physical T6 {
               | float32 | float64
               | byte      // aliases to uint8
 
+<var>       ::= <id_str> | <anon_id>    // internally represented as symbols
+<anon_id>   ::= <const>_<const>         // (num of entries)_(occurrence num)
 <const>     ::= [0-9]+
-<var>       ::= <name>    // internally represented as symbols
-<name>      ::= _                       // not a name, used for padding
+<id_str>    ::= _                       // not a name, used for padding
               | [a-zA-Z_][a-zA-Z_0-9]*  // cannot be exactly _
 
 =====================================
@@ -173,7 +174,7 @@ physical T6 {
 
   Internally, we convert variable names to symbols.  In the case of constant numeric array sizes, we use the constant as a name surrogate
 
-<PlopSym>   ::= (<name>|<const>, <unique_id>, <SymKind>)
+<PlopSym>   ::= (<var>, <unique_id>, <SymKind>)
 <SymKind>   ::= VAR
               | IDX
               | PTR
@@ -192,7 +193,7 @@ The two kinds VAR and IDX are used to distinguish between a size variable and va
 =====================================
   Path IR
 
-<Token>     ::= () | .<Var> | [<Var>]
+<Token>     ::= () | .<var> | [<var>]
 
 <Path>      ::= ( <Token>+, <Prim>|<const> )
 
@@ -203,7 +204,8 @@ The two kinds VAR and IDX are used to distinguish between a size variable and va
               | <Expr> + <Expr>
               | <Expr> * <Expr>
               | <const>
-              | <symbol>(<Prim>?)
+              | Var(<var>:<Prim>?)
+              | Idx(<var>:<Prim>?)
 
 =====================================
   Typechecking
@@ -235,19 +237,20 @@ Define a MEET operation in the expected way: (commutativity assumed)
   (P /\ P) = P
   (B /\ x) = B
 
-lp_anlaysis( Prim )         = T if the number of bits are specified,
+lp_analysis( Prim )         = T if the number of bits are specified,
                               L otherwise
-lp_anlaysis( *x )           = false
-lp_anlaysis( [v]x )         = is_logical(x)
-lp_anlaysis({ v:x, rs })    = is_phys_logic(x) and is_phys_logic({ rs })
-lp_anlaysis({ v=c, rs })    = is_logical({ rs })
+lp_analysis( *x )           = false
+lp_analysis( [v]x )         = is_logical(x)
+lp_analysis({ v:x, rs })    = lp_analysis(x) /\ lp_analysis({ rs })
+lp_analysis({ v=c, rs })    = lp_analysis({ rs })
+lp_an
 
 is_physical( decl )       = not is_logical( decl )
 
 
 
 =================================================
-  Sizeof a layout
+  SizeOf a layout
 
 The returned expression represents the size of the data described by the declaration.  The values of variables in the expression are not resolved unless they are known to be constant.
 
@@ -276,6 +279,63 @@ offset({ v:x, rs }, .v p, ptr )   = offset(x, p, ptr)
 offset({ w=c, rs }, .v p, ptr )   = offset({ rs }, .v p, ptr)
 
 =================================================
+  Environment Driven SizeOf and Offset
+  Definitions
+
+We want to introduce a form of environment here...
+
+Env : Var --> Expr
+
+We assume that the environment keeps track of ERRORS that are encountered.  In particular, if an Env lookup for variable 'x' fails, then Var(x) is returned as the expression and an error is recorded.
+
+csize defines a version of the sizeof() function that will use substitutions specified by an environment, and signal failure if that's insufficient.  Put simply, this will find the size of the declaration, provided that the size is constant with respect to any variables not defined in the environment.
+
+csize : Decl, Env --> Expr
+
+csize( Prim, E )          = # bytes in Prim
+csize( *x,   E )          = # bytes in system pointer
+csize( [v]x, E )          = E(v) * csize(x)
+csize({ v:x, rs }, E )    = csize(x,E) + csize({ rs },E)
+csize({ v=c, rs }, E )    = csize({ rs },E)
+
+This following function computes the offset to an input expression for skipping over a declaration, which is the size of the declaration
+
+offsize : Decl, Env, Expr --> Expr
+
+offsize( Prim, E, ptr )       = # bytes in Prim
+offsize( *x,   E, ptr )       = # bytes in system pointer
+offsize( [v]x, E, ptr )       = E(v) * csize(x,E)
+offsize({ v:SzPrim, rs }, E, ptr ) =      // size var def.
+                  let E' = E[ v -> ptr(SzPrim) ]
+                  in #bytes(SzPrim) +
+                     offsize({ rs }, E', ptr + #bytes(SzPrim) )
+offsize({ v=c, rs }, E, ptr ) =
+                  let E' = E[ v -> c ]
+                  in offsize({ rs }, E', ptr )
+offsize({ v:x, rs }, E, ptr ) =
+                  let S = offsize(x, E, ptr)
+                  in  S + offsize({ rs }, E', ptr + S )
+
+
+Now, offrec can be defined using this function
+
+pathoff : Decl, List(Token), Env, Expr --> Expr)
+
+pathoff(     , empty, E, ptr )      = ptr
+pathoff(   *x,  () p, E, ptr )      = pathoff( x, p, E, ptr() )
+pathoff( [v]x, [v] p, E, ptr )      = pathoff( x, p, E,
+                                               ptr + IdxVar(v)*csize(x,E) )
+pathoff({ w:SzPrim, rs }, .v p, E, ptr ) =
+                  let E' = E[ v -> ptr(SzPrim) ]
+                  in pathoff({ rs }, .v p, E', ptr + (# bytes in SzPrim) )
+pathoff({ w=c, rs }, .v p, E, ptr ) =
+                  let E' = E[ v -> c ]
+                  in pathoff({ rs }, .v p, E', ptr )
+pathoff({ w:x, rs }, .v p, E, ptr ) = pathoff({ rs }, .v p, E',
+                                                ptr + offsize(x, E, ptr) )
+pathoff({ v:x, rs }, .v p, E, ptr ) = pathoff( x, p, E, ptr )
+
+=================================================
   Alignment
 
 alignment : Decl -> uint
@@ -297,15 +357,17 @@ g2d( x * y )  = g2d(x) * g2d(y)
 
 NOTE: We assume that the expression has been constant propagated already.
 
-To determine whether or not a given declaration is aligned, we use this function that fuses offset() together with a series of alignment checks.
+To determine whether or not a given declaration is aligned, we use this function that fuses pathoff() together with a series of alignment checks.
+
+We use the csize definition while ignoring errors here.
 
 is_aligned : Decl, Expr --> True?
 
 is_aligned( Prim, addr )          = alignment(Prim) divides g2d(addr)
 is_aligned(  * x, addr )          =    alignment(*) divides g2d(addr)
                                 and  is_aligned( x, addr() )
-is_aligned( [v]x, addr )          =    alignment(x) divides g2d(sizeof(x))
-                                and    alignment(x) divides g2d(addr)
+is_aligned( [v]x, addr )          =    alignment(x) divides g2d(addr)
+                                and    alignment(x) divides g2d(sizeof(x))
                                 and  is_aligned( x, addr + sizeof(x) * Idx(v) )
 is_aligned({ v=c, rs }, addr )    =  is_aligned( { rs }, addr )
 is_aligned({ v:x, rs }, addr )    =  alignment(x) divides g2d(addr)

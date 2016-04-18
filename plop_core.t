@@ -93,51 +93,11 @@ local function is_id_str(obj)
   return type(obj) == 'string' and string.match(obj,'^[%a_][%w_]*$')
 end
 
----------------------------------------
--- Symbols                           --
----------------------------------------
-
-local ADT V
-  Kind    = VAR
-          | IDX
-          | PTR
-  PlopSym = { name : str_or_uint, unique_id : uint, kind : Kind }
-
-  extern uint is_uint
-  extern str_or_uint function(obj) return is_uint(obj) or is_id_str(obj) end
+local function is_anon_str(obj)
+  return type(obj) == 'string' and string.match(obj,'^%d+_%d+$')
 end
 
-local is_symkind  = V.Kind.check
-local is_sym      = V.PlopSym.check
-local function is_varsym(obj) return is_sym(obj) and obj.kind == V.VAR end
-local function is_idxsym(obj) return is_sym(obj) and obj.kind == V.IDX end
-local function is_nonesym(obj) return is_sym(obj) and obj.name == '_' end
-
--- check if the names match independent of unique identity or kind
-function V.PlopSym:matches(rhs)
-  return is_sym(rhs) and self.name == rhs.name
-end
-
--- constructors
-local unique_id_count = 0
-local function PlopSym(name)
-  unique_id_count = unique_id_count + 1
-  return V.PlopSym(name, unique_id_count, V.VAR)
-end
-local function PlopIdxSym(name)
-  unique_id_count = unique_id_count + 1
-  if is_sym(name) then name = name.name end
-  return V.PlopSym(name, unique_id_count, V.IDX)
-end
--- unique pointer symbol
-local PtrSym = V.PlopSym('ptr', 0, V.PTR)
-
--- symbol printing rules
-function V.PlopSym:uglystr() return '$'..tostring(self.unique_id)..'_'..
-                                    tostring(self.kind)..'_'..self.name end
-function V.PlopSym:prettystr() return tostring(self.name) end
-V.PlopSym.__tostring = V.PlopSym.prettystr
-function V.PlopSym:unqstr() return '_'..self.name..tostring(self.unique_id) end
+local function is_var_str(obj) return is_id_str(obj) or is_anon_str(obj) end
 
 
 ---------------------------------------
@@ -153,8 +113,9 @@ local ADT A
         attributes  { linenumber : uint?,
                       offset     : uint?,
                       filename   : string? }
-  Rec   = Def     { name : symbol, typ : Decl }
-        | Const   { name : symbol, val : uint  }
+  Rec   = Def     { name : id_str, typ : Decl }
+        | Const   { name : id_str, val : uint  }
+        | Chunk   { name : id_str, numerator : id_str, denominator : id_str }
         attributes  { linenumber : uint?,
                       offset     : uint?,
                       filename   : string? }
@@ -170,7 +131,8 @@ local ADT A
         | FLOAT32 | FLOAT64
 
   extern uint   is_uint
-  extern symbol is_sym
+  extern symbol is_var_str
+  extern id_str is_id_str
 end
 
 local string_to_primitive = {
@@ -204,9 +166,8 @@ end
 -- ugly may be useful for internal debugging...
 for _,T in pairs(A) do T.uglystr = T.__tostring end
 for s,p in pairs(string_to_primitive) do
-  getmetatable(p).__tostring = function() return s end
+  if s ~= 'byte' then getmetatable(p).__tostring = function() return s end end
 end
-getmetatable(A.UINT8).__tostring = function() return 'uint8' end
 
 function A.Array:prettystr(indent)
   local size = self.sizevar and self.sizevar or self.sizeval
@@ -231,6 +192,11 @@ function A.Const:prettystr(indent)
   indent = indent or ''
   return indent..tostring(self.name)..' = '..tostring(self.val)
 end
+function A.Chunk:prettystr(indent)
+  indent = indent or ''
+  return indent..tostring(self.name)..' = '..tostring(self.numerator)..
+                                      ' / '..tostring(self.denominator)
+end
 function A.DPrim:prettystr(indent)
   return tostring(self.prim)
 end
@@ -241,6 +207,7 @@ A.Ptr.__tostring    = A.Ptr.prettystr
 A.DPrim.__tostring  = A.DPrim.prettystr
 A.Def.__tostring    = A.Def.prettystr
 A.Const.__tostring  = A.Const.prettystr
+A.Chunk.__tostring  = A.Chunk.prettystr
 
 function A.Decl:prettyprint()   print(self:prettystr()) end
 function A.Decl:uglyprint()     print(self:uglystr()) end
@@ -280,6 +247,7 @@ local is_struct = A.Struct.check
 local is_decl   = A.Decl.check
 local is_def    = A.Def.check
 local is_const  = A.Const.check
+local is_chunk  = A.Chunk.check
 local is_rec    = A.Rec.check
 
 ---------------------------------------
@@ -292,7 +260,7 @@ local ADT P
             | Index { name : symbol }
   Path      = { tokens : Token*, terminal : type_or_const }
 
-  extern symbol         is_sym
+  extern symbol         is_var_str
   extern type_or_const  function(obj) return is_prim(obj) or is_uint(obj) end
 end
 
@@ -305,6 +273,20 @@ function P.Path:__tostring()
   return subs:concat('')..':'..tostring(self.terminal)
 end
 
+local size_num_bound_table = {
+  [ A.SIZE   ] = math.huge,
+  [ A.SIZE8  ] = math.pow(2,8),
+  [ A.SIZE16 ] = math.pow(2,16),
+  [ A.SIZE32 ] = math.pow(2,32),
+  [ A.SIZE64 ] = math.huge,
+}
+local function size_bound_of_num(num)
+  if      num < math.pow(2,8)   then  return A.SIZE8
+  elseif  num < math.pow(2,16)  then  return A.SIZE16
+  elseif  num < math.pow(2,32)  then  return A.SIZE32
+                                else  return A.SIZE64 end
+end
+
 ---------------------------------------
 -- Expression IR                     --
 ---------------------------------------
@@ -314,17 +296,19 @@ local ADT E
             | Add     { const : uint,   exprs : Expr* }
             | Mul     { const : uint,   exprs : Expr* }
             | Var     { name  : symbol, type  : SizePrim? }
+            | Idx     { name  : symbol, type  : SizePrim? }
             | Const   { val   : uint   }
+            | Ptr
 
   extern uint       is_uint
-  extern symbol     is_sym
+  extern symbol     is_var_str
   extern Prim       is_prim
   extern SizePrim   is_size_prim
 end
 
 -- memoize all expression constructors
 local NewE = {}
-for _,n in ipairs{'DeRef', 'Add', 'Mul', 'Var', 'Const'} do
+for _,n in ipairs{'DeRef', 'Add', 'Mul', 'Var', 'Idx', 'Const'} do
   local e = E[n]
   if n=='Add' or n=='Mul' then
     local memed = memoize(e)
@@ -334,11 +318,11 @@ for _,n in ipairs{'DeRef', 'Add', 'Mul', 'Var', 'Const'} do
   end
 end
 
-local PtrVar = NewE.Var(PtrSym)
+local PtrVar = E.Ptr
 
 
 function E.DeRef:__tostring()
-  local typstr = self.typ and '[&'..tostring(self.typ)..']' or ''
+  local typstr = self.prim and '[&'..tostring(self.prim)..']' or ''
   return '@'..typstr..'('..tostring(self.expr)..')'
 end
 function E.Add:__tostring()
@@ -359,10 +343,16 @@ function E.Var:__tostring()
           and '('..tostring(self.name).. ':'..tostring(self.type)..')'
           or tostring(self.name)
 end
+function E.Idx:__tostring()
+  return self.type
+          and '('..tostring(self.name).. ':'..tostring(self.type)..')'
+          or tostring(self.name)
+end
 function E.Const:__tostring()   return self.val end
 
 local is_econst = E.Const.check
 local is_evar   = E.Var.check
+local is_eidx   = E.Idx.check
 local is_emul   = E.Mul.check
 local is_eadd   = E.Add.check
 local is_ederef = E.DeRef.check
@@ -395,6 +385,13 @@ local function terra_decl_parser(lexer)
     return const
   end
 
+  local function parseIdStr()
+    local id = lexer:expect(lexer.name).value
+    if not is_id_str(id) then
+      lexer:error('expected valid identifier string') end
+    return id
+  end
+
   local function get_loc()
     -- linenumber, offset, filename
     return { lexer:cur().linenumber, lexer:cur().offset, lexer.source }
@@ -410,14 +407,22 @@ local function terra_decl_parser(lexer)
     return A.DPrim(prim, unpack(loc))
   end
 
+
   local function parseRec()
     local loc  = get_loc()
-    local name = lexer:expect(lexer.name).value
+    local name = parseIdStr()
     if lexer:nextif(':') then
-      return A.Def( PlopSym(name), parseDecl(), unpack(loc) )
+      return A.Def( name, parseDecl(), unpack(loc) )
     else
       lexer:expect('=')
-      return A.Const( PlopSym(name), parseConst(), unpack(loc) )
+      if lexer:matches(lexer.number) then
+        return A.Const( name, parseConst(), unpack(loc) )
+      else
+        local numerator, _, denominator = parseIdStr(),
+                                          lexer:expect('/'),
+                                          parseIdStr()
+        return A.Chunk( name, numerator, denominator, unpack(loc) )
+      end
     end
   end
 
@@ -449,7 +454,7 @@ local function terra_decl_parser(lexer)
     if lexer:matches(lexer.number) then
       sz_val = parseConst()
     else
-      sz_name = PlopSym( lexer:expect(lexer.name).value )
+      sz_name = parseIdStr()
     end
     lexer:expectmatch(']','[',openline)
     return A.Array(sz_name,nil,sz_val, parseDecl(), unpack(loc))
@@ -491,6 +496,9 @@ local null_loc = { 0, 0, 'no_src' }
 local function clone_decl(decl)
   if      is_const(decl)  then
     return A.Const( decl.name, decl.val, unpack(null_loc) )
+  elseif  is_chunk(decl)  then
+    return A.Chunk( decl.name, decl.numerator,
+                    decl.denominator, unpack(null_loc) )
   elseif  is_def(decl)    then
     return A.Def( decl.name, clone_decl(decl.typ), unpack(null_loc) )
   elseif  is_dprim(decl)  then
@@ -507,7 +515,7 @@ local function clone_decl(decl)
 end
 
 function Exports.ArrayOf(size, decl)
-  local sizevar = is_id_str(size) and PlopSym(size) or nil
+  local sizevar = is_id_str(size) and size or nil
   local sizeval = is_uint(size) and size or nil
   if not sizeval and not sizevar then
     error('first argument must be either a variable name or uint', 2)
@@ -537,7 +545,7 @@ function Exports.DefOf(name, decl)
   if not is_pre_decl(decl) then
     error('second argument must be a type declaration', 2)
   end
-  return NewPreRec(A.Def( PlopSym(name), decl._hidden_decl ))
+  return NewPreRec(A.Def( name, decl._hidden_decl ))
 end
 function Exports.ConstOf(name, val)
   if not is_id_str(name) then
@@ -546,7 +554,16 @@ function Exports.ConstOf(name, val)
   if not is_uint(val) then
     error('second argument must be a uint', 2)
   end
-  return NewPreRec(A.Const( PlopSym(name), val ))
+  return NewPreRec(A.Const( name, val ))
+end
+function Exports.ChunkOf(name, numerator, denominator)
+  if not is_id_str(name) then
+    error('first argument must be a variable name', 2) end
+  if not is_id_str(numerator) then
+    error('second argument must be a variable name', 2) end
+  if not is_id_str(denominator) then
+    error('third argument must be a variable name', 2) end
+  return NewPreRec(A.Chunk( name, numerator, denominator ))
 end
 function Exports.StructOf(...)
   local entries = newlist()
@@ -635,6 +652,7 @@ end
 
 -- holds PathSet objects keyed on A.Decl objects
 local allpaths_weak_cache = setmetatable({},{__mode = "k"})
+local varpaths_weak_cache = setmetatable({},{__mode = "k"})
 
 local PathSet = {}
 PathSet.__index = PathSet
@@ -658,33 +676,6 @@ function PathSet:addpaths(set)
   for path,_ in pairs(set.paths) do self.paths[path] = true end
 end
 
-
-
--- holds PathMap objects keyed on A.Decl objects
-local varstore_weak_cache = setmetatable({},{__mode = "k"})
-
-local PathMap = {}
-PathMap.__index = PathMap
-local function newPathMap()
-  return setmetatable({ paths={} },PathMap)
-end
-function PathMap:prepend(token)
-  local map = newPathMap()
-  for sym,path in pairs(self.paths) do
-    map.paths[sym] = P.Path( newlist{ token, unpack(path.tokens) },
-                             path.terminal )
-  end
-  return map
-end
-function PathMap:addvar(sym, terminal)
-  self.paths[sym] = P.Path( newlist{ P.Field(sym) }, terminal )
-end
-function PathMap:addpaths(map)
-  for sym,path in pairs(map.paths) do self.paths[sym] = path end
-end
-
-
-
 function PathSet:is_ambiguous()
   -- this could be substantially more efficient...
   for p1,_ in pairs(self.paths) do
@@ -701,10 +692,6 @@ function PathSet:is_ambiguous()
   return false
 end
 
--- Results from typechecking
-local function decl_varpath(decl, sym)
-  return varstore_weak_cache[decl].paths[sym].tokens
-end
 
 -------------------------------------------------------------------------------
 -- Logical Sub-Typing of Decls
@@ -750,13 +737,6 @@ local function prim_subtype(lhp, rhp)
       or prim_supertype_table[lhp] == rhp
       or (rhp == A.BOOL and prim_supertype_table[lhp] == A.UINT)
 end
-local size_num_bound_table = {
-  [ A.SIZE   ] = math.huge,
-  [ A.SIZE8  ] = math.pow(2,8),
-  [ A.SIZE16 ] = math.pow(2,16),
-  [ A.SIZE32 ] = math.pow(2,32),
-  [ A.SIZE64 ] = math.huge,
-}
 local function terminal_subtype(lpath, rpath)
   local lht, rht = lpath.terminal, rpath.terminal
   local lnum = type(lht) == 'number' and lht
@@ -848,7 +828,12 @@ local max_int32_val = math.pow(2,31)-1
 local function typechecking_array(self, ctxt)
   -- determine type and or const value
   if self.sizeval then -- had a constant annotation
-    self.sizevar  = PlopSym(self.sizeval)
+    -- append an identifier distinguishing successive array lookups
+    local lookup  = ctxt:env()[self.sizeval]
+    lookup        = lookup and (lookup+1) or 0
+    self.sizevar  = tostring(self.sizeval)..'_'..lookup
+    ctxt:env()[self.sizeval] = lookup
+
     self.sizetype = (self.sizeval < max_int32_val) and A.SIZE32 or A.SIZE64
   else
     local symname = tostring(self.sizevar)
@@ -863,20 +848,22 @@ local function typechecking_array(self, ctxt)
                         "' used here was undefined.")
       end
     else
-      self.sizevar  = lookup.sym
-      self.sizeval  = lookup.val -- one of these will be nil
-      self.sizetype = lookup.typ -- one of these will be nil
+      self.sizevar    = lookup.sym
+      self.sizeval    = lookup.val -- one of these will be nil
+      self.sizetype   = lookup.typ -- one of these will be nil
+      self.size_num   = lookup.numerator
+      self.size_denom = lookup.denominator
     end
   end
 
   local vars, paths = typechecking_pass( self.typ, ctxt )
-  return vars:prepend(P.Index(PlopIdxSym(self.sizevar))),
-         paths:prepend(P.Index(PlopIdxSym(self.sizevar)))
+  return vars:prepend(P.Index(self.sizevar)),
+         paths:prepend(P.Index(self.sizevar))
 end
 
 --function A.Struct:typecheck(ctxt)
 local function typechecking_struct(self, ctxt)
-  local varstore, allpaths = newPathMap(), newPathSet()
+  local varpaths, allpaths = newPathSet(), newPathSet()
 
   ctxt:pushscope()
   self._lookup_fields = {}
@@ -888,16 +875,37 @@ local function typechecking_struct(self, ctxt)
   end
   for i_rec,rec in ipairs(self.entries) do
     local namestr = tostring(rec.name)
-    if A.Const.check(rec) then
+    if is_const(rec) then
       if namestr == '_' then
         ctxt:error(self,"cannot assign a constant value to "..
                         "the special no-name character '_'")
       end
       addlookup(namestr, i_rec, rec)
       ctxt:env()[namestr] = { sym=rec.name, val=rec.val }
+      --local size_typ = size_bound_of_num(rec.val)
       allpaths:addpath(rec.name, rec.val)
+    elseif is_chunk(rec) then
+      if namestr == '_' then
+        ctxt:error(self,"cannot assign a chunked value to "..
+                        "the special no-name character '_'")
+      end
+      local env = ctxt:env()
+      local num, denom = rec.numerator, rec.denominator
+      local numrec, denomrec = env[num], env[denom]
+      if not denomrec or not denomrec.val then
+        ctxt:error(self,"denominator in chunked expression must be "..
+                        "a constant variable") end
+      if not numrec or not numrec.typ then
+        ctxt:error(self,"numerator in chunked expression must be "..
+                        "a size variable")
+      else
+        addlookup(namestr, i_rec, rec)
+        env[namestr] = { sym=rec.name, typ = numrec.typ,
+                         numerator=num, denominator=denomrec.val }
+        allpaths:addpath(rec.name, numrec.typ)
+      end
     else -- A.Def
-      if A.DPrim.check(rec.typ) then
+      if is_dprim(rec.typ) then
         -- add all variables to the allpaths; only size variables
         -- to the variable store
         if namestr ~= '_' then
@@ -906,7 +914,7 @@ local function typechecking_struct(self, ctxt)
         end
         if is_size_prim(rec.typ.prim) then
           ctxt:env()[namestr] = { sym=rec.name, typ=rec.typ.prim }
-          varstore:addvar(rec.name, rec.typ.prim)
+          varpaths:addpath(rec.name, rec.typ.prim)
         else
           ctxt:env()[namestr] = { errtyp=rec.typ.prim }
         end
@@ -916,35 +924,35 @@ local function typechecking_struct(self, ctxt)
           addlookup(namestr, i_rec, rec)
           allpaths:addpaths( paths:prepend(P.Field(rec.name)) )
         end
-        varstore:addpaths( vars:prepend(P.Field(rec.name)) )
+        varpaths:addpaths( vars:prepend(P.Field(rec.name)) )
       end
     end
   end
   ctxt:popscope()
 
-  return varstore, allpaths
+  return varpaths, allpaths
 end
 
 function typechecking_pass(decl, ctxt)
-  local varstore, allpaths
+  local varpaths, allpaths
 
   if is_dprim(decl) then
+    varpaths = newPathSet()
     allpaths = newPathSet()
     allpaths:addpath(nil,decl.prim)
-    varstore = newPathMap() -- empty store
   elseif is_ptr(decl) then
     local vars, paths = typechecking_pass(decl.typ, ctxt)
     allpaths          = paths:prepend(P.DeRef)
-    varstore          = vars:prepend(P.DeRef)
+    varpaths          = vars:prepend(P.DeRef)
   elseif is_array(decl) then
-    varstore, allpaths = typechecking_array(decl, ctxt)
+    varpaths, allpaths = typechecking_array(decl, ctxt)
   else --is_struct(decl) then
-    varstore, allpaths = typechecking_struct(decl, ctxt)
+    varpaths, allpaths = typechecking_struct(decl, ctxt)
   end
 
-  varstore_weak_cache[decl] = varstore
+  varpaths_weak_cache[decl] = varpaths
   allpaths_weak_cache[decl] = allpaths
-  return varstore, allpaths
+  return varpaths, allpaths
 end
 
 local function typecheck_decl(decl)
@@ -1103,188 +1111,159 @@ local primitive_sizes = {
   [ A.FLOAT32 ]   = NewE.Const(4),
   [ A.FLOAT64 ]   = NewE.Const(8),
 }
-local function sizeof_decl(decl)
-  if      is_prim(decl)   then  return primitive_sizes[decl]
-  elseif  is_dprim(decl)  then  return primitive_sizes[decl.prim]
-  elseif  is_ptr(decl)    then  return pointer_size
+
+-------------------------------------------------------------------------------
+-- Environment-Based SizeOf and Offset
+-------------------------------------------------------------------------------
+
+local Recursive_Environment   = {}
+Recursive_Environment.__index = Recursive_Environment
+
+local function New_Recursive_Environment()
+  return setmetatable({
+    _vars = {},
+    _errs = newlist(),
+  }, Recursive_Environment)
+end
+
+function Recursive_Environment:lookup(var_id,typ)
+  local val = self._vars[var_id]
+  if val then
+    return val
+  else
+    self._errs:insert("failed to lookup '"..var_id.."'")
+    return NewE.Var(var_id,typ) -- dummy value
+  end
+end
+function Recursive_Environment:bind(var_id, expr)
+  self._vars[var_id] = expr
+end
+function Recursive_Environment:haserrors() return #self._errs > 0 end
+function Recursive_Environment:geterrors() return self._errs end
+function Recursive_Environment:pushenv()
+  local prev_vars = self._vars
+  self._vars      = setmetatable({},{ __index=prev_vars })
+end
+function Recursive_Environment:popenv()
+  self._vars      = getmetatable(self._vars).__index
+end
+
+local function const_size(decl,env) -- returns Expr
+  if      is_prim(decl)   then return primitive_sizes[decl]
+  elseif  is_dprim(decl)  then return primitive_sizes[decl.prim]
+  elseif  is_ptr(decl)    then return pointer_size
   elseif  is_array(decl)  then
-    local n_elems = decl.sizeval and NewE.Const(decl.sizeval)
-                                  or NewE.Var(decl.sizevar,decl.sizetype)
-    return n_elems * sizeof_decl(decl.typ)
+    local n_elems = (decl.sizeval and NewE.Const(decl.sizeval)
+                                   or env:lookup(decl.sizevar,decl.sizetype))
+    return n_elems * const_size(decl.typ,env)
   elseif  is_struct(decl) then
     local sz = NewE.Const(0)
-    for _,e in ipairs(decl.entries) do if is_def(e) then
-      sz = sz + sizeof_decl(e.typ)
+    for _,rec in ipairs(decl.entries) do if is_def(rec) then
+      sz = sz + const_size(rec.typ,env)
     end end
     return sz
   end
 end
 
--------------------------------------------------------------------------------
--- Offset Expressions
--------------------------------------------------------------------------------
+-- returns the size of the declaration, with the capability of reading
+-- data and extending the environment appropriately.
+local function offsize(decl,env,ptr) -- returns Expr
+  if is_struct(decl) then
+    local sz = NewE.Const(0)
+    env:pushenv()
+    for _,rec in ipairs(decl.entries) do
+      if is_def(rec) then
+        if is_dprim(rec.typ) and is_size_prim(rec.typ.prim) then
+          env:bind( rec.name, ptr:deref(rec.typ.prim) )
+        end
+        local s = offsize(rec.typ, env, ptr)
+        ptr = ptr + s
+        sz  = sz  + s
+      end
+      --elseif is_const(rec) then
+      --  env:bind(rec.name, NewE.Const(rec.val))
+      --end
+    end
+    env:popenv()
+    return sz
+  else
+    return const_size(decl,env)
+  end
+end
 
 local offpath_err = 'invalid path arg to offset'
-local function decl_offset(decl, ptr, ...)
+local function pathoff(decl, env, ptr, ...)
   if select('#',...) == 0 then return ptr end
 
-  if      is_dprim(decl)  then  assert(false, offpath_err)
-  elseif  is_struct(decl) then
+  if is_struct(decl) then
     local f_name = assert(select(1,...).name, offpath_err)
-    for _,rec in ipairs(decl.entries) do if rec.typ then
-      if rec.name == f_name then
-        return decl_offset(rec.typ, ptr, select(2,...))
-      else ptr = ptr + sizeof_decl(rec.typ) end
-    end end
+    env:pushenv()
+    for _,rec in ipairs(decl.entries) do
+      if is_def(rec) then
+        if rec.name == f_name then
+          return pathoff(rec.typ, env, ptr, select(2,...))
+        elseif is_dprim(rec.typ) and is_size_prim(rec.typ.prim) then
+          env:bind( rec.name, ptr:deref(rec.typ.prim) )
+        end
+        ptr = ptr + offsize(rec.typ, env, ptr)
+      end
+      --elseif is_const(rec) then
+      --  env:bind(rec.name, NewE.Const(rec.val))
+      --end
+    end
     assert(false, offpath_err)
-  elseif  is_array(decl) then
+  elseif is_array(decl) then
     local idxvar = select(1,...).name
-    assert(idxvar and idxvar:matches(decl.sizevar), offpath_err)
-    return decl_offset( decl.typ,
-                        ptr + NewE.Var(idxvar) * sizeof_decl(decl.typ) )
-  else -- is ptr
+    assert(idxvar == decl.sizevar, offpath_err)
+    return pathoff( decl.typ, env,
+                    ptr + NewE.Idx(idxvar) * const_size(decl.typ, env),
+                    select(2,...) )
+  elseif is_ptr(decl) then -- is ptr
     assert(P.DeRef.check(select(1,...)), offpath_err)
-    return decl_offset( decl.typ, ptr:deref(), select(2,...) )
+    return pathoff( decl.typ, env, ptr:deref(), select(2,...) )
+  else
+    assert(false, offpath_err)
   end
 end
 
-local function p_offset(decl, tokens, ptr)
-  ptr = ptr or NewE.Const(0)
-  return decl_offset(decl, ptr, unpack(tokens))
+-- returns nil when failures
+local function const_sizeof_decl(decl)
+  local env   = New_Recursive_Environment()
+  local size  = const_size(decl,env)
+  if env:haserrors() then return nil else return size end
 end
 
--------------------------------------------------------------------------------
--- Variable Expansion ( & Random Access Checks / Semantics )
--------------------------------------------------------------------------------
-
-local ExprExpandContext   = {}
-ExprExpandContext.__index = ExprExpandContext
-local function NewExprExpandContext(decl, interp, public_exec)
-  local ctxt = setmetatable({
-    decl            = decl,
-    interpretation  = interp,
-    public_exec     = public_exec,
-    expanded_vars   = {},
-    cache           = {},
-    errors          = newlist(),
-  }, ExprExpandContext)
-  return ctxt
+-- returns the expression with variables in place of failed lookups
+local function sizeof_expr(decl)
+  return const_size(decl, New_Recursive_Environment())
 end
-function ExprExpandContext:haserrors()    return #self.errors > 0   end
-function ExprExpandContext:get_errors()   return self.errors        end
-
--- Expression Interpretation
---  Interp : Expr --> X
---      deref : X,Prim --> X
---        add : X,X --> X
---        mul : X,X --> X
---   variable : name,Prim --> X
---     idxvar : name --> X
---      const : num --> X
---    default : nil --> X
---        ptr : nil --> X
-
-local public_sym_convert, public_prim_convert
-
-function ExprExpandContext:varlookup(varsym,vartype)
-  -- guard against infinite recursive expansions
-  if self.expanded_vars[varsym] then
-    self.errors:insert(varsym)
-    return self.interpretation.default()
-  end
-  -- see if this is a pointer variable
-  if PtrSym == varsym then return self.interpretation.ptr() end
-
-  -- possibly convert the arguments if the interpreter is public, i.e.
-  -- is being provided from somewhere outside this core file
-  local symarg, primarg = varsym, vartype
-  if self.public_exec then
-    symarg,primarg = public_sym_convert(varsym), public_prim_convert(vartype)
-  end
-
-  -- try to find the variable's definition
-  if is_idxsym(varsym) then return self.interpretation.idxvar(symarg) end
-  local val = self.interpretation.variable(symarg,primarg)
-  if val then return val end
-
-  -- otherwise, do the expansion
-  if not self.cache[varsym] then
-    self.expanded_vars[varsym]  = true -- infinite recursion guard
-      local tokens    = assert(decl_varpath(self.decl, varsym))
-      local expr      = p_offset( self.decl, tokens, NewE.Var(PtrSym) )
-      self.cache[varsym] = self.interpretation.deref(
-        expr:_ExprExpand(self),   -- recursive expansion
-        primarg                   -- size type
-      )
-    self.expanded_vars[varsym]  = nil  -- exit guard
-  end
-  return self.cache[varsym]
-end
-
-function E.Add:_ExprExpand(ctxt)
-  local val = ctxt.interpretation.const( self.const )
-  for _,e in ipairs(self.exprs) do
-    val = ctxt.interpretation.add( val, e:_ExprExpand(ctxt) )
-  end
-  return val
-end
-function E.Mul:_ExprExpand(ctxt)
-  local val = ctxt.interpretation.const( self.const )
-  for _,e in ipairs(self.exprs) do
-    val = ctxt.interpretation.mul( val, e:_ExprExpand(ctxt) )
-  end
-  return val
-end
-function E.DeRef:_ExprExpand(ctxt)
-  return ctxt.interpretation.deref( self.expr:_ExprExpand(ctxt), self.typ )
-end
-function E.Const:_ExprExpand(ctxt)
-  return ctxt.interpretation.const( self.val )
-end
-function E.Var:_ExprExpand(ctxt)
-  return ctxt:varlookup(self.name,self.type)
-end
-
-function A.SIZE8:toterratyp()     return uint8  end
-function A.SIZE16:toterratyp()    return uint16 end
-function A.SIZE32:toterratyp()    return uint32 end
-function A.SIZE64:toterratyp()    return uint64 end
-function A.UINT8:toterratyp()     return uint8  end
-function A.UINT16:toterratyp()    return uint16 end
-function A.UINT32:toterratyp()    return uint32 end
-function A.UINT64:toterratyp()    return uint64 end
-function A.INT8:toterratyp()      return int8   end
-function A.INT16:toterratyp()     return int16  end
-function A.INT32:toterratyp()     return int32  end
-function A.INT64:toterratyp()     return int64  end
-function A.FLOAT32:toterratyp()   return float  end
-function A.FLOAT64:toterratyp()   return double end
 
 
 -------------------------------------------------------------------------------
 -- Random Access Analysis
 -------------------------------------------------------------------------------
 
-local rand_access_check_interp = {
-  deref     = function(x, prim) end,
-  add       = function(x,y) end,
-  mul       = function(x,y) end,
-  const     = function(n) end,
-  default   = function() end,
-  ptr       = function() end,
-  variable  = function(name) end,
-  idxvar    = function(name) end,
-}
+--local rand_access_check_interp = {
+--  deref     = function(x, prim) end,
+--  add       = function(x,y) end,
+--  mul       = function(x,y) end,
+--  const     = function(n) end,
+--  default   = function() end,
+--  ptr       = function() end,
+--  variable  = function(name) end,
+--  idxvar    = function(name) end,
+--}
 local function is_path_random_access(decl, path_tokens)
-  local ctxt = NewExprExpandContext(decl, rand_access_check_interp)
-  p_offset(decl, path_tokens):_ExprExpand(ctxt)
-  if ctxt:haserrors() then return false, ctxt:get_errors() end
+  local env = New_Recursive_Environment()
+  pathoff( decl, env, NewE.Const(0), unpack(path_tokens) )
+  if env:haserrors() then return false, env:geterrors() end
   return true
 end
 
-local function get_varpaths_to_check(decl, varpaths)
-  for _,p in pairs(varstore_weak_cache[decl].paths) do
-    varpaths:insert( p.tokens )
+local function get_paths_to_check(decl, paths)
+  for p,_ in pairs(varpaths_weak_cache[decl].paths) do
+    assert(is_size_prim(p.terminal))
+    paths:insert( p.tokens )
   end
 end
 
@@ -1293,11 +1272,11 @@ for _,prim in pairs(all_primitives) do rand_access_weak_cache[prim] = true end
 local function is_random_access(decl)
   if rand_access_weak_cache[decl] then return true end
 
-  local varpaths = newlist()
-  get_varpaths_to_check(decl, varpaths)
+  local paths = newlist()
+  get_paths_to_check(decl, paths)
 
-  for _,vpath in ipairs(varpaths) do
-    local status, errs = is_path_random_access(decl, vpath)
+  for _,tkns in ipairs(paths) do
+    local status, errs = is_path_random_access(decl, tkns)
     if not status then return status, errs end
   end
   
@@ -1310,9 +1289,12 @@ end
 -------------------------------------------------------------------------------
 
 local function alignment(decl)
-  if      is_def(decl) or is_array(decl)  then  return alignment(decl.typ)
-  elseif  is_dprim(decl) or is_ptr(decl)  then  return sizeof_decl(decl).val
-  elseif  is_const(decl)  then  return 0
+  if      is_def(decl) or is_array(decl)  then 
+    return alignment(decl.typ)
+  elseif  is_dprim(decl) or is_ptr(decl)  then 
+    return const_sizeof_decl(decl).val
+  elseif  is_const(decl)  then
+    return 0
   elseif  is_struct(decl) then
     local a = 0
     for _,r in ipairs(decl.entries) do  a = math.max(a, alignment(r)) end
@@ -1358,6 +1340,7 @@ local function align_err(decl, req, actual)
     decl.filename, decl.linenumber, req, actual )
   return false, errstr
 end
+
 local function is_aligned(decl, addr)
   if is_struct(decl) then
     addr = addr or NewE.Const(0)
@@ -1367,7 +1350,7 @@ local function is_aligned(decl, addr)
         if a > d then return align_err(rec, a,d) end
         local status, err = is_aligned( rec.typ, addr )
         if not status then return status, err end
-        addr = addr + sizeof_decl(rec.typ)
+        addr = addr + sizeof_expr(rec.typ)
       end
     end
     return true
@@ -1377,10 +1360,10 @@ local function is_aligned(decl, addr)
     if      is_dprim(decl) then return true
     elseif  is_ptr(decl) then return is_aligned( decl.typ, addr:deref() )
     else -- array
-      local xd = g2d( sizeof_decl(decl.typ) )
+      local xd = g2d( sizeof_expr(decl.typ) )
       if a > xd then return align_err(decl,a,xd)
       else return is_aligned( decl.typ,
-        addr + sizeof_decl(decl.typ) * NewE.Var(decl.sizevar, decl.sizetype)
+        addr + sizeof_expr(decl.typ) * NewE.Var(decl.sizevar, decl.sizetype)
       ) end
     end
   end
@@ -1509,7 +1492,7 @@ function LayoutWrapper:fields()
     local fs = newlist()
     field_list_weak_cache[self] = fs
     for _,rec in ipairs(self._decl.entries) do
-      fs:insert { name=(rec.name ~= '_' and tostring(rec.name) or nil),
+      fs:insert { name=rec.name,
                   typ=rec.typ and rec.typ._wrapper,
                   val=rec.val }
     end
@@ -1674,7 +1657,20 @@ end
 function PrimitiveWrapper:terra_prim() return self._decl:toterratyp() end
 function LayoutWrapper:terra_prim() return nil end
 
-
+function A.SIZE8:toterratyp()     return uint8  end
+function A.SIZE16:toterratyp()    return uint16 end
+function A.SIZE32:toterratyp()    return uint32 end
+function A.SIZE64:toterratyp()    return uint64 end
+function A.UINT8:toterratyp()     return uint8  end
+function A.UINT16:toterratyp()    return uint16 end
+function A.UINT32:toterratyp()    return uint32 end
+function A.UINT64:toterratyp()    return uint64 end
+function A.INT8:toterratyp()      return int8   end
+function A.INT16:toterratyp()     return int16  end
+function A.INT32:toterratyp()     return int32  end
+function A.INT64:toterratyp()     return int64  end
+function A.FLOAT32:toterratyp()   return float  end
+function A.FLOAT64:toterratyp()   return double end
 
 
 -------------------------------------------------------------------------------
@@ -1774,8 +1770,17 @@ local Interpreter   = {}
 Interpreter.__index = Interpreter
 local function is_interpreter(obj) return getmetatable(obj) == Interpreter end
 
+-- Expression Interpretation
+--  Interp : Expr --> X
+--      deref : X,Prim --> X
+--        add : X,X --> X
+--        mul : X,X --> X
+--   variable : name,Prim --> X
+--     idxvar : name --> X
+--      const : num --> X
+--        ptr : nil --> X
 local interpreter_methods = { 'deref', 'add', 'mul', 'const',
-                              'default', 'ptr', 'variable' }
+                              'ptr', 'variable', 'idxvar' }
 local function set_as_interpreter(obj)
   for _,fname in ipairs(interpreter_methods) do
     if not type(obj[fname]) == 'function' then
@@ -1788,17 +1793,53 @@ end
 function public_sym_convert(sym) return tostring(sym) end
 function public_prim_convert(prim)
   return prim and primitive_wrappers[prim] end
-local function public_sym_to_private(pub, construct, err_level)
-  err_level = (err_level or 1)+1
-  if not type(pub) == 'string' then error('expected string',err_level) end
-  if string.find(pub, "^%d+$") then -- number
-    return construct(tonumber(pub))
-  elseif is_id_str(pub) then -- number
-    return construct(pub)
-  else error('invalid string pattern for variable symbol', err_level) end
+local function public_sym_to_private(pub, err_level)
+  return pub
+  --err_level = (err_level or 1)+1
+  --if not type(pub) == 'string' then error('expected string',err_level) end
+  --if string.find(pub, "^%d+$") then -- number
+  --  return pub
+  --elseif is_id_str(pub) then -- number
+  --  return construct(pub)
+  --else error('invalid string pattern for variable symbol', err_level) end
 end
 
-local function eval_sizeof(layout, interpreter)
+function E.Add:Interpret(interpreter)
+  local val = interpreter.const( self.const )
+  for _,e in ipairs(self.exprs) do
+    val = interpreter.add( val, e:Interpret(interpreter) )
+  end
+  return val
+end
+function E.Mul:Interpret(interpreter)
+  local val = interpreter.const( self.const )
+  for _,e in ipairs(self.exprs) do
+    val = interpreter.mul( val, e:Interpret(interpreter) )
+  end
+  return val
+end
+function E.DeRef:Interpret(interpreter)
+  return interpreter.deref( self.expr:Interpret(interpreter),
+                            public_prim_convert(self.prim) )
+end
+function E.Const:Interpret(interpreter)
+  return interpreter.const( self.val )
+end
+function E.Var:Interpret(interpreter)
+  return interpreter.variable( public_sym_convert(self.name),
+                               public_prim_convert(self.type) )
+end
+function E.Idx:Interpret(interpreter)
+  return interpreter.idxvar( public_sym_convert(self.name),
+                             public_prim_convert(self.type) )
+end
+function E.Ptr:Interpret(interpreter)
+  return interpreter.ptr()
+end
+
+
+
+local function eval_sizeof(layout, interpreter, opts)
   if not is_physical(layout) then
     error('expected a physical layout as the first argument', 2) end
   if not is_interpreter(interpreter) then
@@ -1807,15 +1848,22 @@ local function eval_sizeof(layout, interpreter)
     error('cannot symbolically evaluate the size of a layout '..
           'that is not randomly accessible', 2) end
 
-  local is_public = true
-  local ctxt    = NewExprExpandContext(layout._decl, interpreter, is_public)
-  local result  = sizeof_decl(layout._decl):_ExprExpand(ctxt)
-  assert(not ctxt:haserrors()) -- random access check should have covered
+  local size
+
+  local env = New_Recursive_Environment()
+  if type(opts) == 'table' and opts.no_expand then
+    size  = const_size(layout._decl, env)
+  else
+    size  = offsize(layout._decl, env, PtrVar)
+  end
+  local result = size:Interpret(interpreter)
+  -- environment may have errors due to binding in the interpreter
+  -- not being exposed to Recursive_Environment; that's ok
   return result
 end
 local function static_sizeof(layout)
-  local e = sizeof_decl(layout._decl)
-  if is_econst(e) then return e.val else return nil end
+  local e = const_sizeof_decl(layout._decl)
+  return e and e.val or nil
 end
 
 local function eval_offset(layout, path, interpreter)
@@ -1840,12 +1888,12 @@ local function eval_offset(layout, path, interpreter)
       tkns:insert(P.DeRef)
       subdecl = subdecl.typ
     elseif is_array_decl(subdecl) then
-      if not is_uint(tonumber(v)) and not is_id_str(v) then
-        error("expected id string or uint string (representing array "..
-              "indexing) as path entry #"..i, 2) end
-      local sym = public_sym_to_private(v,PlopIdxSym,2)
+      if not is_var_str(v) then
+        error("expected id or anonymous (size_instance) string "..
+              "(representing array indexing) as path entry #"..i, 2) end
+      local sym = public_sym_to_private(v,2)
       local size = subdecl.sizevar
-      if not size:matches(sym) then
+      if not size == sym then
         error("expected '"..tostring(size).."' (representing array "..
               "indexing) as path entry #"..i, 2) end
       tkns:insert(P.Index(sym))
@@ -1878,10 +1926,12 @@ local function eval_offset(layout, path, interpreter)
     else assert(false, 'IMPOSSIBLE CASE') end
   end
 
-  local is_public = true
-  local ctxt    = NewExprExpandContext(layout._decl, interpreter, is_public)
-  local result  = p_offset(layout._decl, tkns, PtrVar):_ExprExpand(ctxt)
-  assert(not ctxt:haserrors()) -- random access check should have covered
+
+  local env       = New_Recursive_Environment()
+  local off_expr  = pathoff(layout._decl, env, PtrVar, unpack(tkns))
+  local result    = off_expr:Interpret(interpreter)
+  -- environment may have errors due to binding in the interpreter
+  -- not being exposed to Recursive_Environment; that's ok
   return result
 end
 

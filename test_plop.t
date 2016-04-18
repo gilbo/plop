@@ -84,7 +84,7 @@ end, 'required alignment is 8 bytes.*guaranteed to align to 4 bytes')
 
 test('alignment test 2',function()
   local plop physical Synthetic {
-    n_vals : uint32
+    n_vals : size32
     issue  : float64
          _ : uint32
   }
@@ -92,7 +92,7 @@ end, 'required alignment is 8 bytes.*guaranteed to align to 4 bytes')
 
 test('ambiguous padding names ok',function()
   local plop physical Synthetic {
-    n_vals : uint32
+    n_vals : size32
          _ : uint32
     issue  : float64
          _ : uint64
